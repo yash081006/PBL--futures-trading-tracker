@@ -1,0 +1,699 @@
+#Selective expiry input for current and next month even for contracts that are not available (those will be shown in terminal for input)
+#Enable DataLogging based on choice (with True/False)
+#Printing Entry Spread, Exit Spread, Spread Diff (Exit - Entry), and Z-score 
+
+import csv
+import json
+import os
+import time
+import logging
+from datetime import datetime, timedelta, date
+from kiteconnect import KiteConnect, KiteTicker
+import webbrowser
+
+# Configuration
+API_KEY = "yybb01jjerokopsn" # Replace with your API key
+API_SECRET = "yg31qo1a7ut41kp09grqbzrxry43c6hb" # Replace with your API secret
+TOKEN_FILE = "access_token.json"
+CSV_FILE_PATH = r"/Users/shivanshagarwal/Documents/VSCode/Files_Data_Input/NFO_MCX_Combined_symbol.csv"
+STATS_CSV_PATH = r"/Users/shivanshagarwal/Documents/VSCode/Files_Data_Input/NFO_MCX_Combined_Stat.csv"
+
+# Logging Configuration
+ENABLE_LOGGING = True  # Set to False to disable logging
+COMBINED_LOG_FILE_PATH = r"/Users/shivanshagarwal/Documents/VSCode/Data_logging/Spread_data_Fri.Csv"
+INDIVIDUAL_LOG_DIR = r"/Users/shivanshagarwal/Documents/VSCode/Data_logging/Spread_data_Fri/seperate_data.csv"
+
+# Month Selection Configuration
+AUTO_SELECT_MONTHS = False  # Set to True for automatic month selection, False for manual prompts
+
+
+# Specify the months for futures contracts (1-12, where 1=January, 12=December)
+CURRENT_MONTH = 7  # July 2025
+NEXT_MONTH = 8     # August 2025
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+class ZerodhaFuturesTracker:
+    def __init__(self, api_key, api_secret):
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.kite = KiteConnect(api_key=api_key)
+        self.kws = None
+        self.access_token = None
+        self.symbols_data = []
+        self.stats_data = {}  # Dictionary to store mean and std dev for each symbol
+        self.instrument_tokens = []
+        self.logging_enabled = ENABLE_LOGGING
+        if self.logging_enabled:
+            self.setup_logging_directories()
+        
+    def setup_logging_directories(self):
+        """Create directories for logging if they don't exist"""
+        if not self.logging_enabled:
+            return
+            
+        try:
+            # Create directory for combined log
+            combined_log_dir = os.path.dirname(COMBINED_LOG_FILE_PATH)
+            if not os.path.exists(combined_log_dir):
+                os.makedirs(combined_log_dir)
+                logger.info(f"Created directory: {combined_log_dir}")
+            
+            # Create directory for individual symbol logs
+            if not os.path.exists(INDIVIDUAL_LOG_DIR):
+                os.makedirs(INDIVIDUAL_LOG_DIR)
+                logger.info(f"Created directory: {INDIVIDUAL_LOG_DIR}")
+                
+            # Initialize combined log file with headers if it doesn't exist
+            if not os.path.exists(COMBINED_LOG_FILE_PATH):
+                with open(COMBINED_LOG_FILE_PATH, 'w', newline='') as file:
+                    writer = csv.writer(file)
+                    writer.writerow([
+                        'timestamp', 'symbol', 'exchange', 'entry_spread', 'exit_spread', 
+                        'spread_difference', 'z_score', 'next_bid', 'current_ask', 
+                        'next_ask', 'current_bid'
+                    ])
+                logger.info(f"Initialized combined log file: {COMBINED_LOG_FILE_PATH}")
+                    
+        except Exception as e:
+            logger.error(f"Error setting up logging directories: {e}")
+            raise
+    
+    def log_data_to_files(self, symbol, exchange, entry_spread, exit_spread, spread_difference, 
+                         z_score, next_bid, current_ask, next_ask, current_bid):
+        """Log data to both combined and individual symbol files"""
+        if not self.logging_enabled:
+            return
+            
+        try:
+            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            
+            # Prepare data row
+            data_row = [
+                timestamp, symbol, exchange, entry_spread, exit_spread, 
+                spread_difference, z_score if z_score is not None else 'N/A', 
+                next_bid, current_ask, next_ask, current_bid
+            ]
+            
+            # Log to combined file
+            with open(COMBINED_LOG_FILE_PATH, 'a', newline='') as file:
+                writer = csv.writer(file)
+                writer.writerow(data_row)
+            
+            # Log to individual symbol file
+            individual_file_path = os.path.join(INDIVIDUAL_LOG_DIR, f"{symbol}_{exchange}_log.csv")
+            
+            # Create individual file with headers if it doesn't exist
+            if not os.path.exists(individual_file_path):
+                with open(individual_file_path, 'w', newline='') as file:
+                    writer = csv.writer(file)
+                    writer.writerow([
+                        'timestamp', 'entry_spread', 'exit_spread', 'spread_difference', 
+                        'z_score', 'next_bid', 'current_ask', 'next_ask', 'current_bid'
+                    ])
+            
+            # Append data to individual file
+            with open(individual_file_path, 'a', newline='') as file:
+                writer = csv.writer(file)
+                writer.writerow([
+                    timestamp, entry_spread, exit_spread, spread_difference,
+                    z_score if z_score is not None else 'N/A',
+                    next_bid, current_ask, next_ask, current_bid
+                ])
+                
+        except Exception as e:
+            logger.error(f"Error logging data for {symbol}: {e}")
+    
+    def load_access_token(self):
+        """Load access token from file if it exists and is valid"""
+        if os.path.exists(TOKEN_FILE):
+            try:
+                with open(TOKEN_FILE, 'r') as f:
+                    token_data = json.load(f)
+                    self.access_token = token_data.get('access_token')
+                    expiry = datetime.fromisoformat(token_data.get('expiry', ''))
+                    
+                    if datetime.now() < expiry:
+                        self.kite.set_access_token(self.access_token)
+                        logger.info("Loaded valid access token from file")
+                        return True
+                    else:
+                        logger.info("Stored access token has expired")
+                        os.remove(TOKEN_FILE)
+                        return False
+            except Exception as e:
+                logger.error(f"Error loading access token: {e}")
+                if os.path.exists(TOKEN_FILE):
+                    os.remove(TOKEN_FILE)
+                return False
+        return False
+    
+    def save_access_token(self, access_token):
+        """Save access token to file with expiry"""
+        token_data = {
+            'access_token': access_token,
+            'expiry': (datetime.now() + timedelta(hours=6)).isoformat()  # Tokens typically expire in 6 hours
+        }
+        with open(TOKEN_FILE, 'w') as f:
+            json.dump(token_data, f)
+        logger.info("Access token saved to file")
+    
+    def authenticate(self):
+        """Handle authentication process"""
+        if self.load_access_token():
+            try:
+                # Test if token is valid by making a simple API call
+                self.kite.profile()
+                return True
+            except Exception as e:
+                logger.error(f"Access token validation failed: {e}")
+                if os.path.exists(TOKEN_FILE):
+                    os.remove(TOKEN_FILE)
+        
+        # Need new token
+        login_url = f"https://kite.zerodha.com/connect/login?api_key={self.api_key}&v=3"
+        print(f"\nPlease login and authorize the app at: {login_url}")
+        webbrowser.open(login_url)
+        
+        request_token = input("\nEnter the request token from the redirect URL: ").strip()
+        
+        try:
+            data = self.kite.generate_session(request_token, api_secret=self.api_secret)
+            self.access_token = data["access_token"]
+            self.kite.set_access_token(self.access_token)
+            self.save_access_token(self.access_token)
+            logger.info("Authentication successful")
+            return True
+        except Exception as e:
+            logger.error(f"Authentication failed: {e}")
+            return False
+    
+    def load_stats_from_csv(self):
+        """Load mean and standard deviation from stats CSV file"""
+        try:
+            with open(STATS_CSV_PATH, 'r') as file:
+                csv_reader = csv.DictReader(file)
+                for row in csv_reader:
+                    # Expecting CSV columns: symbol, mean, std_dev
+                    if 'symbol' in row and 'mean' in row and 'std_dev' in row:
+                        symbol = row['symbol'].strip()
+                        self.stats_data[symbol] = {
+                            'mean': float(row['mean']),
+                            'std_dev': float(row['std_dev'])
+                        }
+            logger.info(f"Loaded stats for {len(self.stats_data)} symbols from stats CSV")
+        except Exception as e:
+            logger.error(f"Error loading stats CSV file: {e}")
+            raise
+            
+    def load_symbols_from_csv(self):
+        """Load symbols and exchanges from CSV file"""
+        try:
+            with open(CSV_FILE_PATH, 'r') as file:
+                csv_reader = csv.DictReader(file)
+                for row in csv_reader:
+                    # Expecting CSV columns: symbol, exchange
+                    # Example: RELIANCE, MCX
+                    if 'symbol' in row and 'exchange' in row:
+                        self.symbols_data.append({
+                            'symbol': row['symbol'].strip(),
+                            'exchange': row['exchange'].strip()
+                        })
+                    elif 'symbol' in row:
+                        # If no exchange column, use MCX as default
+                        self.symbols_data.append({
+                            'symbol': row['symbol'].strip(),
+                            'exchange': 'MCX'
+                        })
+                        logger.warning(f"No exchange specified for {row['symbol']}, using MCX as default")
+                    else:
+                        # If no headers, treat first two columns as symbol and exchange
+                        keys = list(row.keys())
+                        if len(keys) >= 2:
+                            self.symbols_data.append({
+                                'symbol': row[keys[0]].strip(),
+                                'exchange': row[keys[1]].strip()
+                            })
+                        elif len(keys) == 1:
+                            self.symbols_data.append({
+                                'symbol': row[keys[0]].strip(),
+                                'exchange': 'MCX'
+                            })
+            logger.info(f"Loaded {len(self.symbols_data)} symbols from CSV")
+        except Exception as e:
+            logger.error(f"Error loading CSV file: {e}")
+            raise
+    
+    def calculate_z_score(self, symbol, spread_value):
+        """Calculate Z-score for a given symbol and spread value"""
+        if symbol in self.stats_data:
+            mean = self.stats_data[symbol]['mean']
+            std_dev = self.stats_data[symbol]['std_dev']
+            if std_dev != 0:
+                z_score = (spread_value - mean) / std_dev
+                return z_score
+        return None
+    
+    def get_available_months_for_symbol(self, symbol, symbol_futures, current_date):
+        """Get available months for a symbol"""
+        available_months = {}
+        for fut in symbol_futures:
+            expiry = fut['expiry']
+            if isinstance(expiry, str):
+                expiry_date = datetime.strptime(expiry, '%Y-%m-%d').date()
+            elif hasattr(expiry, 'date'):
+                expiry_date = expiry.date() if hasattr(expiry, 'date') else expiry
+            else:
+                expiry_date = expiry
+            
+            # Only consider non-expired contracts
+            if expiry_date > current_date:
+                month = expiry_date.month
+                if month not in available_months or expiry_date < available_months[month]['expiry_date']:
+                    available_months[month] = {
+                        'contract': fut,
+                        'expiry_date': expiry_date
+                    }
+        return available_months
+
+    def prompt_for_alternative_months(self, symbol, available_months):
+        """Prompt user to select alternative months for a problematic symbol"""
+        print(f"\n{'='*60}")
+        print(f"ISSUE WITH SYMBOL: {symbol}")
+        print(f"Current Month Config: {CURRENT_MONTH} | Next Month Config: {NEXT_MONTH}")
+        print("Available months for this symbol:")
+        
+        month_names = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun", 
+                      "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+        
+        for month, data in sorted(available_months.items()):
+            print(f"  {month} ({month_names[month]}): Expires {data['expiry_date']}")
+        
+        print("\nOptions:")
+        print("1. Enter alternative months for this symbol")
+        print("2. Skip this symbol")
+        print("3. Abort and fix configuration")
+        
+        while True:
+            choice = input("Enter your choice (1/2/3): ").strip()
+            
+            if choice == "1":
+                while True:
+                    try:
+                        current_input = input(f"Enter current month for {symbol} (1-12): ").strip()
+                        next_input = input(f"Enter next month for {symbol} (1-12): ").strip()
+                        
+                        current_alt = int(current_input)
+                        next_alt = int(next_input)
+                        
+                        if not (1 <= current_alt <= 12) or not (1 <= next_alt <= 12):
+                            print("Error: Months must be between 1 and 12")
+                            continue
+                        
+                        if current_alt == next_alt:
+                            print("Error: Current and next months cannot be the same")
+                            continue
+                        
+                        if current_alt not in available_months:
+                            print(f"Error: Month {current_alt} not available for {symbol}")
+                            continue
+                        
+                        if next_alt not in available_months:
+                            print(f"Error: Month {next_alt} not available for {symbol}")
+                            continue
+                        
+                        return current_alt, next_alt
+                        
+                    except ValueError:
+                        print("Error: Please enter valid numbers")
+                        continue
+            
+            elif choice == "2":
+                return None, None
+            
+            elif choice == "3":
+                print("Aborting. Please fix the month configuration and restart.")
+                raise Exception("User chose to abort due to month configuration issues")
+            
+            else:
+                print("Invalid choice. Please enter 1, 2, or 3")
+
+    def get_futures_instruments(self):
+        """Get futures instruments for specified months - OPTIMIZED VERSION"""
+        try:
+            current_date = datetime.now()
+            futures_instruments = []
+            symbol_month_overrides = {}
+            
+            # Group symbols by exchange to minimize API calls
+            exchange_groups = {}
+            for symbol_data in self.symbols_data:
+                exchange = symbol_data['exchange']
+                if exchange not in exchange_groups:
+                    exchange_groups[exchange] = []
+                exchange_groups[exchange].append(symbol_data['symbol'])
+            
+            print(f"Processing {len(self.symbols_data)} symbols across {len(exchange_groups)} exchanges...")
+            
+            # Process each exchange group
+            for exchange, symbols in exchange_groups.items():
+                print(f"Fetching instruments for {exchange} exchange...")
+                
+                # Single API call per exchange
+                try:
+                    instruments = self.kite.instruments(exchange)
+                    print(f"Retrieved {len(instruments)} instruments from {exchange}")
+                except Exception as e:
+                    logger.error(f"Failed to get instruments for {exchange}: {e}")
+                    continue
+                
+                # Create lookup dictionary for faster access
+                futures_by_symbol = {}
+                for inst in instruments:
+                    if inst['instrument_type'] == 'FUT':
+                        symbol_name = inst['name']
+                        if symbol_name not in futures_by_symbol:
+                            futures_by_symbol[symbol_name] = []
+                        futures_by_symbol[symbol_name].append(inst)
+                
+                # Process symbols for this exchange
+                processed_count = 0
+                for symbol in symbols:
+                    if symbol not in futures_by_symbol:
+                        logger.warning(f"No futures found for {symbol} on {exchange}")
+                        continue
+                    
+                    symbol_futures = futures_by_symbol[symbol]
+                    
+                    # Get available months for this symbol
+                    available_months = self.get_available_months_for_symbol(symbol, symbol_futures, current_date.date())
+                    
+                    if not available_months:
+                        logger.warning(f"No non-expired futures for {symbol} on {exchange}")
+                        continue
+                    
+                    # Use override months if available, otherwise use global config
+                    current_month_to_use = symbol_month_overrides.get(symbol, {}).get('current', CURRENT_MONTH)
+                    next_month_to_use = symbol_month_overrides.get(symbol, {}).get('next', NEXT_MONTH)
+                    
+                    # Check if configured months are available
+                    current_month_future = None
+                    next_month_future = None
+                    
+                    if current_month_to_use in available_months:
+                        current_month_future = available_months[current_month_to_use]['contract']
+                        current_month_future['expiry_date'] = available_months[current_month_to_use]['expiry_date']
+                    
+                    if next_month_to_use in available_months:
+                        next_month_future = available_months[next_month_to_use]['contract']
+                        next_month_future['expiry_date'] = available_months[next_month_to_use]['expiry_date']
+                    
+                    # Handle missing months - either auto-select or prompt user
+                    if not current_month_future or not next_month_future:
+                        if AUTO_SELECT_MONTHS:
+                            # Auto-select the next available months
+                            sorted_months = sorted(available_months.keys())
+                            
+                            if len(sorted_months) >= 2:
+                                if not current_month_future:
+                                    current_month_to_use = sorted_months[0]
+                                    current_month_future = available_months[current_month_to_use]['contract']
+                                    current_month_future['expiry_date'] = available_months[current_month_to_use]['expiry_date']
+                                
+                                if not next_month_future:
+                                    next_month_to_use = sorted_months[1] if sorted_months[1] != current_month_to_use else (sorted_months[2] if len(sorted_months) > 2 else None)
+                                    if next_month_to_use:
+                                        next_month_future = available_months[next_month_to_use]['contract']
+                                        next_month_future['expiry_date'] = available_months[next_month_to_use]['expiry_date']
+                            
+                            if not current_month_future or not next_month_future:
+                                logger.warning(f"Skipping {symbol} on {exchange} - insufficient contract months")
+                                continue
+                            else:
+                                logger.info(f"Auto-selected months for {symbol}: {current_month_to_use}, {next_month_to_use}")
+                        else:
+                            # Manual prompt for missing months (original behavior)
+                            missing = []
+                            if not current_month_future:
+                                missing.append(f"current month ({current_month_to_use})")
+                            if not next_month_future:
+                                missing.append(f"next month ({next_month_to_use})")
+                            
+                            print(f"\nERROR: {symbol} on {exchange} - Missing {' and '.join(missing)} future contract(s)")
+                            
+                            # Prompt for alternative months
+                            alt_current, alt_next = self.prompt_for_alternative_months(symbol, available_months)
+                            
+                            if alt_current is None or alt_next is None:
+                                logger.info(f"Skipping {symbol} on {exchange} as requested by user")
+                                continue
+                            
+                            # Store the override and use the new months
+                            symbol_month_overrides[symbol] = {'current': alt_current, 'next': alt_next}
+                            current_month_future = available_months[alt_current]['contract']
+                            current_month_future['expiry_date'] = available_months[alt_current]['expiry_date']
+                            next_month_future = available_months[alt_next]['contract']
+                            next_month_future['expiry_date'] = available_months[alt_next]['expiry_date']
+                    
+                    # Add to futures instruments
+                    futures_instruments.append({
+                        'symbol': symbol,
+                        'exchange': exchange,
+                        'current_month': current_month_future,
+                        'next_month': next_month_future
+                    })
+                    
+                    # Collect instrument tokens for websocket
+                    self.instrument_tokens.extend([
+                        current_month_future['instrument_token'],
+                        next_month_future['instrument_token']
+                    ])
+                    
+                    processed_count += 1
+                    
+                    # Print progress every 20 symbols
+                    if processed_count % 20 == 0:
+                        print(f"Processed {processed_count}/{len(symbols)} symbols for {exchange}")
+                
+                print(f"Completed {exchange}: {processed_count}/{len(symbols)} symbols processed")
+            
+            self.futures_data = futures_instruments
+            logger.info(f"TOTAL: Found valid futures data for {len(futures_instruments)} symbols")
+            
+            if len(futures_instruments) == 0:
+                logger.error("No valid futures contracts found. Please check the configuration.")
+                raise Exception("No valid futures contracts found")
+            
+        except Exception as e:
+            logger.error(f"Error getting futures instruments: {e}")
+            raise
+    
+    def on_ticks(self, ws, ticks):
+        """Handle incoming tick data"""
+        # Create a dictionary to store latest prices for each symbol
+        symbol_prices = {}
+        
+        for tick in ticks:
+            instrument_token = tick['instrument_token']
+            
+            # Find which symbol this tick belongs to
+            for symbol_futures in self.futures_data:
+                current_token = symbol_futures['current_month']['instrument_token']
+                next_token = symbol_futures['next_month']['instrument_token']
+                symbol = symbol_futures['symbol']
+                exchange = symbol_futures['exchange']
+                
+                if symbol not in symbol_prices:
+                    symbol_prices[symbol] = {
+                        'exchange': exchange,
+                        'current_ask': None, 'current_bid': None, 
+                        'next_ask': None, 'next_bid': None
+                    }
+                
+                if instrument_token == current_token:
+                    # Current month future - get both ask and bid prices
+                    ask_price = tick.get('depth', {}).get('sell', [{}])[0].get('price')
+                    bid_price = tick.get('depth', {}).get('buy', [{}])[0].get('price')
+                    if ask_price:
+                        symbol_prices[symbol]['current_ask'] = ask_price
+                    if bid_price:
+                        symbol_prices[symbol]['current_bid'] = bid_price
+                    
+                elif instrument_token == next_token:
+                    # Next month future - get both ask and bid prices
+                    ask_price = tick.get('depth', {}).get('sell', [{}])[0].get('price')
+                    bid_price = tick.get('depth', {}).get('buy', [{}])[0].get('price')
+                    if ask_price:
+                        symbol_prices[symbol]['next_ask'] = ask_price
+                    if bid_price:
+                        symbol_prices[symbol]['next_bid'] = bid_price
+        
+        # Calculate and print spreads with Z-scores for symbols that have all required prices
+        for symbol, prices in symbol_prices.items():
+            if prices['current_ask'] and prices['next_bid'] and prices['next_ask'] and prices['current_bid']:
+                entry_spread = prices['next_bid'] - prices['current_ask']
+                exit_spread = prices['next_ask'] - prices['current_bid']
+                spread_difference = exit_spread - entry_spread
+                z_score = self.calculate_z_score(symbol, entry_spread)
+                exchange = prices['exchange']
+                
+                # Print to console
+                if z_score is not None:
+                    print(f"{symbol} ({exchange}) | Entry Spread: ₹{entry_spread:.2f} | Exit Spread: ₹{exit_spread:.2f} | Spread Diff: ₹{spread_difference:.2f} | Z-Score: {z_score:.2f} | Next Bid: ₹{prices['next_bid']:.2f} | Current Ask: ₹{prices['current_ask']:.2f} | Next Ask: ₹{prices['next_ask']:.2f} | Current Bid: ₹{prices['current_bid']:.2f}")
+                else:
+                    print(f"{symbol} ({exchange}) | Entry Spread: ₹{entry_spread:.2f} | Exit Spread: ₹{exit_spread:.2f} | Spread Diff: ₹{spread_difference:.2f} | Z-Score: N/A | Next Bid: ₹{prices['next_bid']:.2f} | Current Ask: ₹{prices['current_ask']:.2f} | Next Ask: ₹{prices['next_ask']:.2f} | Current Bid: ₹{prices['current_bid']:.2f}")
+                
+                # Log to files
+                if self.logging_enabled:
+                    self.log_data_to_files(
+                        symbol, exchange, entry_spread, exit_spread, spread_difference,
+                        z_score, prices['next_bid'], prices['current_ask'], 
+                        prices['next_ask'], prices['current_bid']
+                    )
+    
+    def on_connect(self, ws, response):
+        """Handle websocket connection"""
+        logger.info("WebSocket connected successfully")
+        # Subscribe to instruments
+        ws.subscribe(self.instrument_tokens)
+        ws.set_mode(ws.MODE_FULL, self.instrument_tokens)  # Full mode for depth data
+    
+    def on_error(self, ws, code, reason):
+        """Handle websocket errors"""
+        logger.error(f"WebSocket error: {code} - {reason}")
+    
+    def on_close(self, ws, code, reason):
+        """Handle websocket close"""
+        logger.info(f"WebSocket closed: {code} - {reason}")
+    
+    def start_websocket(self):
+        """Start the websocket connection"""
+        try:
+            self.kws = KiteTicker(self.api_key, self.access_token)
+            self.kws.on_ticks = self.on_ticks
+            self.kws.on_connect = self.on_connect
+            self.kws.on_error = self.on_error
+            self.kws.on_close = self.on_close
+            
+            logger.info("Starting WebSocket connection...")
+            self.kws.connect(threaded=True)
+            
+        except Exception as e:
+            logger.error(f"Error starting websocket: {e}")
+            raise
+    
+    def run(self):
+        """Main execution function"""
+        try:
+            # Authenticate
+            if not self.authenticate():
+                logger.error("Authentication failed")
+                return
+            
+            # Load symbols
+            self.load_symbols_from_csv()
+            if not self.symbols_data:
+                logger.error("No symbols loaded from CSV")
+                return
+            
+            # Load statistics
+            self.load_stats_from_csv()
+            if not self.stats_data:
+                logger.warning("No statistics loaded - Z-scores will not be calculated")
+            
+            # Get futures instruments
+            self.get_futures_instruments()
+            if not self.futures_data:
+                logger.error("No futures data found")
+                return
+            
+            # Print summary
+            print("\n" + "="*60)
+            print("ZERODHA FUTURES LIVE PRICE TRACKER")
+            if self.logging_enabled:
+                print("WITH LOGGING ENABLED")
+            else:
+                print("LOGGING DISABLED")
+            print("="*60)
+            print(f"Current Month: {CURRENT_MONTH} | Next Month: {NEXT_MONTH}")
+            if self.logging_enabled:
+                print(f"Combined Log File: {COMBINED_LOG_FILE_PATH}")
+                print(f"Individual Log Directory: {INDIVIDUAL_LOG_DIR}")
+            print(f"Tracking {len(self.futures_data)} symbols:")
+            for symbol_futures in self.futures_data:
+                symbol = symbol_futures['symbol']
+                exchange = symbol_futures['exchange']
+                current_expiry = symbol_futures['current_month']['expiry']
+                next_expiry = symbol_futures['next_month']['expiry']
+                print(f"  {symbol} ({exchange}): Current({current_expiry}) | Next({next_expiry})")
+            print("="*60)
+            print("Starting WebSocket connection...")
+            print("Live prices will appear below (Ctrl+C to stop):")
+            print()
+            
+            # Start websocket
+            self.start_websocket()
+            
+            # Keep the main thread alive
+            while True:
+                time.sleep(1)
+                
+        except KeyboardInterrupt:
+            logger.info("Stopping tracker...")
+            if self.kws:
+                self.kws.close()
+        except Exception as e:
+            logger.error(f"Error in main execution: {e}")
+            raise
+
+def main():
+    """Main function to run the tracker"""
+    if not API_KEY or API_KEY == "your_api_key_here":
+        print("Please update the API_KEY in the script with your actual API key")
+        return
+    
+    if not API_SECRET or API_SECRET == "your_api_secret_here":
+        print("Please update the API_SECRET in the script with your actual API secret")
+        return
+    
+    if not os.path.exists(CSV_FILE_PATH):
+        print(f"Error: CSV file not found at '{CSV_FILE_PATH}'. Please create the file with your symbols and exchanges.")
+        print("Expected CSV format: symbol,exchange")
+        print("Example:")
+        print("RELIANCE,NSE")
+        print("CRUDEOIL,MCX")
+        return
+    
+    if not os.path.exists(STATS_CSV_PATH):
+        print(f"Error: Stats CSV file not found at '{STATS_CSV_PATH}'. Please create the file with mean and std_dev for each symbol.")
+        return
+    
+    # Validate month configuration
+    if not (1 <= CURRENT_MONTH <= 12):
+        print(f"Error: CURRENT_MONTH must be between 1 and 12. Current value: {CURRENT_MONTH}")
+        return
+    
+    if not (1 <= NEXT_MONTH <= 12):
+        print(f"Error: NEXT_MONTH must be between 1 and 12. Current value: {NEXT_MONTH}")
+        return
+    
+    if CURRENT_MONTH == NEXT_MONTH:
+        print(f"Error: CURRENT_MONTH and NEXT_MONTH cannot be the same. Both are set to: {CURRENT_MONTH}")
+        return
+    
+    print(f"Configuration: Current Month = {CURRENT_MONTH}, Next Month = {NEXT_MONTH}")
+    print(f"Month Selection Mode: {'AUTO' if AUTO_SELECT_MONTHS else 'MANUAL PROMPTS'}")
+    if ENABLE_LOGGING:
+        print(f"Log Files Configuration:")
+        print(f"  Combined Log: {COMBINED_LOG_FILE_PATH}")
+        print(f"  Individual Logs: {INDIVIDUAL_LOG_DIR}")
+    else:
+        print("Logging is DISABLED")
+    
+    tracker = ZerodhaFuturesTracker(API_KEY, API_SECRET)
+    tracker.run()
+
+if __name__ == "__main__":
+    main()
